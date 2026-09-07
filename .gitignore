@@ -1,0 +1,41 @@
+# Bytecode and interpreter caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Build and packaging output
+build/
+dist/
+*.egg-info/
+.eggs/
+work/
+outputs/
+
+# Virtual environments and local environment files
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Tests, coverage, and type-checker caches
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.tox/
+
+# Local databases and logs
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+*.log
+
+# Editors and macOS metadata
+.DS_Store
+.idea/
+.vscode/
+*.swp
