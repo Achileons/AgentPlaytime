@@ -8,7 +8,7 @@ import platform
 import signal
 import sqlite3
 import sys
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
@@ -27,6 +27,14 @@ from agentplaytime.detectors import (
     scan_processes,
 )
 from agentplaytime.storage import Database
+from agentplaytime.statistics import (
+    StatisticsReport,
+    StatsPeriod,
+    ToolStatistics,
+    build_statistics,
+    detect_local_timezone,
+    whole_seconds,
+)
 from agentplaytime.tracker import TrackingEngine, TrackingEvent
 
 
@@ -69,6 +77,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     stats = commands.add_parser("stats", help="show accumulated runtime by tool")
     _add_database_argument(stats)
+    stats.add_argument(
+        "--period",
+        choices=[period.value for period in StatsPeriod],
+        default=StatsPeriod.ALL.value,
+        help="report period: today, week, or all (default: all)",
+    )
+    stats.add_argument(
+        "--json",
+        action="store_true",
+        help="emit machine-readable statistics",
+    )
     stats.set_defaults(handler=_stats_command)
     return parser
 
@@ -150,19 +169,105 @@ def _track_command(args: argparse.Namespace) -> int:
 
 def _stats_command(args: argparse.Namespace) -> int:
     database_path = Path(args.database).expanduser()
+    now = _current_utc_time()
+    local_timezone = detect_local_timezone()
     with Database(database_path) as database:
-        totals = database.runtime_by_tool(as_of=datetime.now(UTC))
+        sessions = database.list_sessions()
 
-    print("AgentPlaytime")
-    print()
-    if not totals:
-        print("No runtime recorded yet.")
-        return 0
-
-    width = max(len(tool) for tool in totals)
-    for tool in _ordered_tools(totals):
-        print(f"{tool:<{width}}  {_format_stats_duration(totals[tool])}")
+    report = build_statistics(
+        sessions,
+        period=args.period,
+        now=now,
+        local_timezone=local_timezone,
+    )
+    if args.json:
+        print(json.dumps(_statistics_payload(report), indent=2))
+    else:
+        _print_statistics_report(report)
     return 0
+
+
+def _print_statistics_report(report: StatisticsReport) -> None:
+    period_title = {
+        StatsPeriod.TODAY: "Today",
+        StatsPeriod.WEEK: "Last 7 days",
+        StatsPeriod.ALL: "All time",
+    }[report.period]
+    print(f"AgentPlaytime — {period_title}")
+    print(f"Timezone: {report.timezone_name}")
+    print(f"Total runtime: {_format_stats_duration(report.total_duration)}")
+    print()
+
+    if not report.tools:
+        print("No runtime recorded for this period.")
+        return
+
+    rows = [
+        (
+            item.tool,
+            _format_stats_duration(item.total_duration),
+            str(item.session_count),
+            _format_stats_duration(item.average_session_duration),
+            _format_stats_duration(item.longest_session_duration),
+            "running" if item.running else "stopped",
+        )
+        for item in _ordered_tool_statistics(report.tools)
+    ]
+    headers = ("Tool", "Total", "Sessions", "Average", "Longest", "Status")
+    widths = [
+        max(len(headers[index]), *(len(row[index]) for row in rows))
+        for index in range(len(headers))
+    ]
+
+    def format_row(row: tuple[str, ...]) -> str:
+        return (
+            f"{row[0]:<{widths[0]}}  "
+            f"{row[1]:>{widths[1]}}  "
+            f"{row[2]:>{widths[2]}}  "
+            f"{row[3]:>{widths[3]}}  "
+            f"{row[4]:>{widths[4]}}  "
+            f"{row[5]:<{widths[5]}}"
+        ).rstrip()
+
+    print(format_row(headers))
+    for row in rows:
+        print(format_row(row))
+
+
+def _statistics_payload(report: StatisticsReport) -> dict[str, Any]:
+    return {
+        "period": report.period.value,
+        "timezone": report.timezone_name,
+        "generated_at": _iso_seconds(report.generated_at),
+        "range": {
+            "start": (
+                None
+                if report.range_start is None
+                else _iso_seconds(report.range_start)
+            ),
+            "end": _iso_seconds(report.range_end),
+        },
+        "total_seconds": whole_seconds(report.total_duration),
+        "tools": [
+            {
+                "tool": item.tool,
+                "total_seconds": whole_seconds(item.total_duration),
+                "session_count": item.session_count,
+                "average_session_seconds": whole_seconds(
+                    item.average_session_duration
+                ),
+                "longest_session_seconds": whole_seconds(
+                    item.longest_session_duration
+                ),
+                "running": item.running,
+            }
+            for item in _ordered_tool_statistics(report.tools)
+        ],
+    }
+
+
+def _iso_seconds(value: datetime) -> str:
+    return value.isoformat(timespec="seconds")
 
 
 def _print_tracking_event(event: TrackingEvent) -> None:
@@ -298,7 +403,15 @@ def _print_doctor_report(report: dict[str, Any], *, show_all: bool = False) -> N
 
 
 def _format_event_duration(duration: timedelta) -> str:
-    seconds = max(0, int(duration.total_seconds()))
+    return _format_duration(duration)
+
+
+def _format_stats_duration(duration: timedelta) -> str:
+    return _format_duration(duration)
+
+
+def _format_duration(duration: timedelta) -> str:
+    seconds = whole_seconds(duration)
     hours, remainder = divmod(seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
     parts: list[str] = []
@@ -310,21 +423,21 @@ def _format_event_duration(duration: timedelta) -> str:
     return " ".join(parts)
 
 
-def _format_stats_duration(duration: timedelta) -> str:
-    seconds = max(0, int(duration.total_seconds()))
-    hours, remainder = divmod(seconds, 3600)
-    minutes, seconds = divmod(remainder, 60)
-    if hours:
-        return f"{hours}h {minutes:02d}m"
-    if minutes:
-        return f"{minutes}m"
-    return f"{seconds}s"
-
-
-def _ordered_tools(totals: dict[str, timedelta]) -> list[str]:
+def _ordered_tools(totals: Mapping[str, object]) -> list[str]:
     supported = [tool for tool in SUPPORTED_TOOLS if tool in totals]
     extras = sorted(set(totals) - set(supported))
     return [*supported, *extras]
+
+
+def _ordered_tool_statistics(
+    statistics: Sequence[ToolStatistics],
+) -> list[ToolStatistics]:
+    by_tool = {item.tool: item for item in statistics}
+    return [by_tool[tool] for tool in _ordered_tools(by_tool)]
+
+
+def _current_utc_time() -> datetime:
+    return datetime.now(UTC)
 
 
 def _positive_float(value: str) -> float:
