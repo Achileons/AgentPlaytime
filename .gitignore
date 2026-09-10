@@ -39,3 +39,28 @@ htmlcov/
 .idea/
 .vscode/
 *.swp
+
+# Local secrets and credentials
+*.pem
+*.key
+*.p12
+*.pfx
+*.mobileprovision
+credentials.json
+credentials.*.json
+client_secret*.json
+service-account*.json
+.netrc
+.npmrc
+.pypirc
+.aws/
+.ssh/
+
+# Generated files, local data, and editor state
+node_modules/
+.cache/
+*.db-*
+*.sqlite-*
+*.sqlite3-*
+*.store
+*.store-*

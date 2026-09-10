@@ -63,25 +63,31 @@ class Database:
     ``":memory:"`` is supported for tests.
     """
 
-    def __init__(self, path: str | Path | None = None) -> None:
+    def __init__(self, path: str | Path | None = None, *, read_only: bool = False) -> None:
         resolved_path: str | Path = default_database_path() if path is None else path
         if str(resolved_path) != ":memory:":
             resolved_path = Path(resolved_path).expanduser()
-            resolved_path.parent.mkdir(parents=True, exist_ok=True)
+            if read_only:
+                if not resolved_path.exists():
+                    raise FileNotFoundError(resolved_path)
+            else:
+                resolved_path.parent.mkdir(parents=True, exist_ok=True)
 
         self.path = resolved_path
         self._lock = RLock()
         self._closed = False
         self._connection = sqlite3.connect(
-            str(resolved_path),
+            (Path(resolved_path).absolute().as_uri() + "?mode=ro") if read_only else str(resolved_path),
             check_same_thread=False,
+            uri=read_only,
         )
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA busy_timeout = 5000")
         self._connection.execute("PRAGMA foreign_keys = ON")
-        if str(resolved_path) != ":memory:":
-            self._connection.execute("PRAGMA journal_mode = WAL")
-        self._initialize_schema()
+        if not read_only:
+            if str(resolved_path) != ":memory:":
+                self._connection.execute("PRAGMA journal_mode = WAL")
+            self._initialize_schema()
 
     def _initialize_schema(self) -> None:
         with self._lock, self._connection:

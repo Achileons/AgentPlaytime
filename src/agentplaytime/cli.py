@@ -5,11 +5,9 @@ from __future__ import annotations
 import argparse
 import json
 import platform
-import signal
 import sqlite3
 import sys
-from collections.abc import Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -36,6 +34,13 @@ from agentplaytime.statistics import (
     whole_seconds,
 )
 from agentplaytime.tracker import TrackingEngine, TrackingEvent
+from agentplaytime.tracker.runtime import (
+    exclusive_tracker_lock as _exclusive_tracker_lock,
+    install_shutdown_handlers as _install_shutdown_handlers,
+    restore_signal_handlers as _restore_signal_handlers,
+)
+from agentplaytime.service.manager import ServiceManager, ServiceStatus
+from agentplaytime.service.power import power_capability
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -89,6 +94,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="emit machine-readable statistics",
     )
     stats.set_defaults(handler=_stats_command)
+
+    service = commands.add_parser("service", help="manage the macOS background tracker")
+    actions = service.add_subparsers(dest="service_action", required=True)
+    for name, help_text in (
+        ("install", "install and start the user LaunchAgent"),
+        ("start", "start the installed service"),
+        ("stop", "stop until explicitly started or next login"),
+        ("restart", "gracefully stop and start the service"),
+        ("status", "show read-only service diagnostics"),
+        ("uninstall", "remove the service, preserving data and logs"),
+    ):
+        action = actions.add_parser(name, help=help_text)
+        action.set_defaults(handler=_service_command)
+        if name == "status":
+            action.add_argument("--json", action="store_true", help="emit structured service status")
     return parser
 
 
@@ -111,6 +131,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 def _doctor_command(args: argparse.Namespace) -> int:
     report = doctor_diagnostics()
+    report["service"] = ServiceManager().status().to_dict()
+    report["service"]["power_api"] = power_capability()
     if args.all:
         process_scan = scan_processes()
         report["all_processes"] = [asdict(process) for process in process_scan.processes]
@@ -124,6 +146,37 @@ def _doctor_command(args: argparse.Namespace) -> int:
     else:
         _print_doctor_report(report, show_all=args.all)
     return 0
+
+
+def _service_command(args: argparse.Namespace) -> int:
+    status = getattr(ServiceManager(), args.service_action)()
+    if getattr(args, "json", False):
+        print(json.dumps(status.to_dict(), indent=2))
+    else:
+        _print_service_status(status)
+    return status.exit_code
+
+
+def _print_service_status(status: ServiceStatus) -> None:
+    print("AgentPlaytime background service")
+    def state(value: bool | None, yes: str, no: str) -> str:
+        return "unknown" if value is None else yes if value else no
+    print(f"Installed: {state(status.installed, 'yes', 'no')}")
+    print(f"Loaded: {state(status.loaded, 'yes', 'no')}")
+    print(f"State: {state(status.running, 'running', 'stopped')}")
+    print(f"PID: {status.pid or '—'}")
+    print(f"Label: {status.label}")
+    print(f"Plist: {status.plist_path}")
+    print(f"Python: {status.python_path}")
+    print(f"Database: {status.database_path}")
+    print(f"Log: {status.log_path}")
+    print(f"Configuration: {state(status.configuration_valid, 'valid', 'invalid')}")
+    print(f"Tracker: {status.tracker_state}")
+    print(f"Power monitoring: {status.power_monitoring}")
+    for warning in status.warnings:
+        print(f"Warning: {warning}")
+    for error in status.errors:
+        print(f"Error: {error}")
 
 
 def _track_command(args: argparse.Namespace) -> int:
@@ -171,8 +224,11 @@ def _stats_command(args: argparse.Namespace) -> int:
     database_path = Path(args.database).expanduser()
     now = _current_utc_time()
     local_timezone = detect_local_timezone()
-    with Database(database_path) as database:
-        sessions = database.list_sessions()
+    try:
+        with Database(database_path, read_only=True) as database:
+            sessions = database.list_sessions()
+    except FileNotFoundError:
+        sessions = []
 
     report = build_statistics(
         sessions,
@@ -396,6 +452,12 @@ def _print_doctor_report(report: dict[str, Any], *, show_all: bool = False) -> N
         for error in errors:
             print(f"  - {error}")
 
+    service = report.get("service")
+    if service is not None:
+        print()
+        _print_service_status(ServiceStatus(**{k: v for k, v in service.items() if k != "power_api"}))
+        print(f"Power API: {service['power_api']['reason']}")
+
     print()
     print(f"Privacy: {report['privacy']}")
     if not show_all:
@@ -487,44 +549,6 @@ def _unknown_detection_reason(
             unavailable.append("process")
         return f"{' and '.join(unavailable)} detector unavailable"
     return None if native_available else "native-app detector unavailable"
-
-
-def _install_shutdown_handlers(stop_event: Event) -> dict[signal.Signals, Any]:
-    previous: dict[signal.Signals, Any] = {}
-
-    def request_shutdown(_signum: int, _frame: object) -> None:
-        stop_event.set()
-
-    for signum in (signal.SIGINT, signal.SIGTERM):
-        previous[signum] = signal.getsignal(signum)
-        signal.signal(signum, request_shutdown)
-    return previous
-
-
-def _restore_signal_handlers(previous: dict[signal.Signals, Any]) -> None:
-    for signum, handler in previous.items():
-        signal.signal(signum, handler)
-
-
-@contextmanager
-def _exclusive_tracker_lock(database_path: Path) -> Iterator[None]:
-    """Prevent two tracker processes from adopting the same open sessions."""
-
-    import fcntl
-
-    lock_path = database_path.with_name(f"{database_path.name}.lock")
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a+", encoding="utf-8") as lock_file:
-        try:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise RuntimeError(
-                f"another tracker is already using {database_path}"
-            ) from exc
-        try:
-            yield
-        finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised by the console script.
